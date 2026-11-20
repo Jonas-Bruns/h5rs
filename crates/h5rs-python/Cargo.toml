@@ -1,0 +1,21 @@
+[package]
+name = "h5rs-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.1"
+license = "MIT"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[features]
+simd-deflate = ["h5rs-core/simd-deflate"]
+
+[dependencies]
+h5rs-core = { package = "h5rs", path = "../..", features = ["s3"] }
+numpy = "0.28"
+pyo3 = { version = "0.28", features = ["extension-module"] }

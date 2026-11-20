@@ -1,0 +1,7 @@
+/target/
+/.venv/
+/.pytest_cache/
+__pycache__/
+/python/h5rs/*.pyd
+/python/h5rs/*.pdb
+/python/h5rs/*.so

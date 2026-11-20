@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "h5rs"
+version = "0.1.0"
+description = "Parallel, read-only access to chunked HDF5 datasets on disk and S3"
+requires-python = ">=3.10,<3.15"
+dependencies = ["numpy>=1.24"]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]
+keywords = ["hdf5", "s3", "numpy"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+]
+
+[tool.maturin]
+manifest-path = "crates/h5rs-python/Cargo.toml"
+python-source = "python"
+module-name = "h5rs._native"
+exclude = ["**/__pycache__/**", "python/h5rs/*.pdb", "python/h5rs/*.pyd", "python/h5rs/*.so"]

@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish this tag to PyPI and GitHub Releases
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify release tag and package versions
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import tomllib
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          version = project["version"]
+          for manifest in ("Cargo.toml", "crates/h5rs-python/Cargo.toml"):
+              package = tomllib.loads(Path(manifest).read_text())["package"]
+              if package["version"] != version:
+                  raise SystemExit(f"{manifest} must use version {version}")
+          expected_ref = f"refs/tags/v{version}"
+          if os.environ["GITHUB_REF"] != expected_ref:
+              raise SystemExit(f"Run this workflow on {expected_ref}")
+      - name: Build source distribution
+        run: |
+          python -m pip install "maturin==1.16.0" "cmake>=3.26" "h5py>=3.16,<4"
+          maturin sdist --out dist
+          python -m pip install --no-build-isolation dist/*.tar.gz
+          python tests/python_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-source
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  wheels:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        platform:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build manylinux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          target: ${{ matrix.platform.target }}
+          maturin-version: v1.16.0
+          manylinux: '2_28'
+          before-script-linux: |
+            python_version='${{ matrix.python }}'
+            abi="cp${python_version/./}"
+            export PATH="/opt/python/$abi-$abi/bin:$PATH"
+            python${{ matrix.python }} -m pip install 'cmake>=3.26'
+          args: --release --locked --interpreter python${{ matrix.python }} --out dist
+      - name: Build native wheel
+        if: runner.os != 'Linux'
+        run: |
+          python -m pip install "maturin==1.16.0" "cmake>=3.26"
+          maturin build --release --locked --compatibility pypi --target ${{ matrix.platform.target }} --interpreter python --out dist
+      - name: Test installed wheel
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          wheel, = Path("dist").glob("h5rs-*.whl")
+          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheel), "h5py>=3.13,<4"])
+          subprocess.check_call([sys.executable, "tests/python_smoke.py"])
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform.target }}-cp${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  verify:
+    needs: [source, wheels]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: |
+          python -m pip install twine
+          python -m twine check --strict dist/*
+
+  pypi:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  github:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: pypi
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); then
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*
+            exit
+          fi
+          missing=()
+          for asset in dist/*; do
+            if ! grep -Fxq -- "${asset##*/}" <<< "$existing_assets"; then
+              missing+=("$asset")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            gh release upload "$RELEASE_TAG" "${missing[@]}"
+          fi
