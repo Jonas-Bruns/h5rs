@@ -160,7 +160,7 @@ Install the published wheel from PyPI.
 python -m pip install h5rs
 ```
 
-The release builds wheels for CPython 3.10–3.14 on Windows x64, Linux x64
+The release builds wheels for CPython 3.10–3.15 on Windows x64, Linux x64
 (glibc 2.28 or newer) and macOS Apple Silicon. Building from source requires
 Rust, CMake and a native C toolchain. For local development, activate a
 virtual environment and run the following from the repository root.

@@ -50,7 +50,14 @@ jobs:
         timeout-minutes: 2
         env:
           RAYON_NUM_THREADS: '2'
-        run: python tests/python_smoke.py
+        run: |
+          python tests/python_smoke.py --write-fixture smoke/reference.h5
+          python tests/python_smoke.py --fixture smoke/reference.h5
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-smoke-fixture
+          path: smoke/reference.h5
+          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-source
@@ -62,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
         platform:
           - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { runner: windows-2025, target: x86_64-pc-windows-msvc }
@@ -91,6 +98,10 @@ jobs:
         run: |
           python -m pip install "maturin==1.16.0" "cmake>=3.26"
           maturin build --release --locked --compatibility pypi --target ${{ matrix.platform.target }} --interpreter python --out dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-smoke-fixture
+          path: smoke
       - name: Test installed wheel
         timeout-minutes: 2
         env:
@@ -102,8 +113,8 @@ jobs:
           import sys
 
           wheel, = Path("dist").glob("h5rs-*.whl")
-          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheel), "h5py>=3.13,<4"])
-          subprocess.check_call([sys.executable, "tests/python_smoke.py"])
+          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheel)])
+          subprocess.check_call([sys.executable, "tests/python_smoke.py", "--fixture", "smoke/reference.h5"])
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.platform.target }}-cp${{ matrix.python }}

@@ -18,7 +18,7 @@ simd-deflate = ["h5rs-core/simd-deflate"]
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 h5rs-core = { package = "h5rs", path = "../..", features = ["s3-async-io"] }
-numpy = "0.28"
+numpy = "0.30"
 pollster = "0.4"
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 rayon = "1.10"

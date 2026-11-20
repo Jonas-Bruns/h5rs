@@ -1,7 +1,7 @@
 # Releasing h5rs
 
 The first release is `v0.1.0`. The workflow builds a source distribution and
-wheels for CPython 3.10–3.14 on Windows x64, Linux x64 and macOS Apple Silicon.
+wheels for CPython 3.10–3.15 on Windows x64, Linux x64 and macOS Apple Silicon.
 It installs and tests each wheel and validates all package metadata before
 publishing.
 
