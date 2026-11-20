@@ -6,6 +6,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 
 ROOT = Path(sys.argv[1])
@@ -79,6 +80,12 @@ class RangeServer(BaseHTTPRequestHandler):
 
 
 class FixtureServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally looks up the bound address with socket.getfqdn().
+        # This loopback fixture can announce its port without waiting for DNS.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):
             super().handle_error(request, client_address)

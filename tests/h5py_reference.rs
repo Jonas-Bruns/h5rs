@@ -89,7 +89,7 @@ fn s3_ranges_read_hdf5_and_overlap() {
 
     let fixtures = generate_fixtures();
     let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/range_server.py");
-    let _server = RangeServer(
+    let mut server = RangeServer(
         Command::new(python())
             .arg(server_path)
             .arg(&fixtures.0)
@@ -102,6 +102,9 @@ fn s3_ranges_read_hdf5_and_overlap() {
             if let Ok(port) = port.parse::<u16>() {
                 break port;
             }
+        }
+        if let Some(status) = server.0.try_wait().expect("check range server process") {
+            panic!("range server exited before reporting its port: {status}");
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
