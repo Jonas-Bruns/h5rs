@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "h5rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-lock",
  "cc",
@@ -220,15 +220,17 @@ dependencies = [
  "parking_lot",
  "pollster",
  "rayon",
+ "rustls",
  "thiserror",
  "tokio",
+ "tower-service",
  "ureq",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "h5rs-python"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-util",
  "h5rs",

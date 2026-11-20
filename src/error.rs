@@ -18,13 +18,34 @@ pub enum Error {
     #[error("invalid S3 range grouping limits")]
     InvalidRangeOptions,
     #[cfg(feature = "s3")]
+    #[error("invalid S3 client timeouts; use finite positive durations")]
+    InvalidS3Timeout,
+    #[cfg(feature = "s3")]
+    #[error("S3 CA bundle {path:?}: {reason}")]
+    CaBundle {
+        path: std::path::PathBuf,
+        reason: &'static str,
+    },
+    #[cfg(feature = "s3")]
+    #[error("S3 DNS resolution failed")]
+    RemoteDns,
+    #[cfg(feature = "s3")]
+    #[error("S3 TLS failed: {0}")]
+    RemoteTls(&'static str),
+    #[cfg(feature = "s3")]
+    #[error("S3 connection failed: {0}")]
+    RemoteConnect(&'static str),
+    #[cfg(feature = "s3")]
+    #[error("S3 timeout during {0}")]
+    RemoteTimeout(&'static str),
+    #[cfg(feature = "s3")]
     #[error("S3 URL refresh failed or returned a different endpoint or path")]
     UrlRefresh,
     #[cfg(feature = "s3")]
     #[error("S3 range request failed (HTTP {0})")]
     RemoteStatus(u16),
     #[cfg(feature = "s3")]
-    #[error("S3 range request failed before receiving headers")]
+    #[error("S3 HTTP transport failed")]
     RemoteTransport,
     #[cfg(feature = "s3")]
     #[error("S3 object no longer matches the identity pinned at open")]

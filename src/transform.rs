@@ -2,6 +2,78 @@ use rayon::prelude::*;
 
 use crate::{error::zeroed, region::Layout, ByteOrder, DType, Error, NumericType, Region};
 
+pub(crate) struct MeanBins {
+    pub axis: usize,
+    pub block: u64,
+    pub shape: [usize; 3],
+}
+
+impl MeanBins {
+    pub fn accumulate(
+        &self,
+        sums: &mut [f64],
+        data: &[u8],
+        dtype: DType,
+        tile: [usize; 3],
+        offset: [u64; 3],
+    ) {
+        let width = dtype.size();
+        let little = dtype.byte_order != ByteOrder::Big;
+        let coordinate = |axis, index| {
+            let source = offset[axis] + index as u64;
+            if axis == self.axis {
+                (source / self.block) as usize
+            } else {
+                source as usize
+            }
+        };
+        macro_rules! accumulate {
+            ($type:ty) => {{
+                for (row, values) in data.chunks_exact(tile[2] * width).enumerate() {
+                    let z = coordinate(0, row / tile[1]);
+                    let y = coordinate(1, row % tile[1]);
+                    let start = (z * self.shape[1] + y) * self.shape[2];
+                    for (x, value) in values.chunks_exact(width).enumerate() {
+                        let value = value.try_into().expect("numeric width");
+                        let value = if little {
+                            <$type>::from_le_bytes(value)
+                        } else {
+                            <$type>::from_be_bytes(value)
+                        };
+                        sums[start + coordinate(2, x)] += value as f64;
+                    }
+                }
+            }};
+        }
+        use NumericType::*;
+        match dtype.kind {
+            I8 => accumulate!(i8),
+            I16 => accumulate!(i16),
+            I32 => accumulate!(i32),
+            I64 => accumulate!(i64),
+            U8 => accumulate!(u8),
+            U16 => accumulate!(u16),
+            U32 => accumulate!(u32),
+            U64 => accumulate!(u64),
+            F32 => accumulate!(f32),
+            F64 => accumulate!(f64),
+        }
+    }
+
+    pub fn finish(&self, sums: Vec<f64>, bytes: &mut [u8], axis_len: u64) {
+        let stride = self.shape[self.axis + 1..].iter().product::<usize>();
+        bytes
+            .par_chunks_exact_mut(8)
+            .zip(sums.into_par_iter())
+            .enumerate()
+            .for_each(|(index, (output, sum))| {
+                let bin = (index / stride % self.shape[self.axis]) as u64;
+                let count = (axis_len - bin * self.block).min(self.block);
+                output.copy_from_slice(&(sum / count as f64).to_le_bytes());
+            });
+    }
+}
+
 pub(crate) fn stride(input: Region, steps: &[isize]) -> Result<Region, Error> {
     if steps.iter().all(|&step| step == 1) {
         return Ok(input);

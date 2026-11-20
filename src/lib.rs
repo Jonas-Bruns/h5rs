@@ -14,6 +14,8 @@ mod region;
 mod s3;
 #[cfg(feature = "s3-async-io")]
 mod s3_async;
+#[cfg(feature = "s3")]
+mod s3_client;
 mod transform;
 
 use std::borrow::Cow;
@@ -31,6 +33,8 @@ use raw::RawFile;
 use region::{Layout, Selection};
 #[cfg(feature = "s3")]
 pub use s3::S3Options;
+#[cfg(feature = "s3")]
+pub use s3_client::{S3Client, S3ClientConfig};
 
 /// Primitive numeric types with standard HDF5 binary representations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,7 +217,7 @@ impl H5File {
         pool: ReadPool,
         options: S3Options,
     ) -> Result<Self, Error> {
-        let object = Arc::new(s3::Object::open(url, pool.threads(), options)?);
+        let object = Arc::new(s3::Object::open(url, options)?);
         // SAFETY: raw stores the Arc for at least as long as the HDF5 file.
         // The dataset handle is likewise dropped before its file reference.
         let metadata = unsafe { metadata::File::open_s3(&object)? };
@@ -420,6 +424,100 @@ impl Dataset {
                 bytes: error::zeroed(size)?,
             };
             Ok(transform::min_max(input, axis, block, output))
+        })
+    }
+
+    /// Average consecutive bins along one axis using a bounded source buffer.
+    /// Bins start at the selected range's first element. The final partial
+    /// bin is included. The result is little-endian float64 and NaNs propagate.
+    pub fn read_mean(
+        &self,
+        ranges: &[Range<u64>],
+        axis: usize,
+        block: usize,
+    ) -> Result<Region, Error> {
+        const STAGING_BYTES: usize = 8 * 1024 * 1024;
+        if axis >= self.metadata.shape.len() || block == 0 {
+            return Err(Error::InvalidTransform);
+        }
+        let width = self.metadata.dtype.size();
+        let source = Selection::new(ranges, &self.metadata.shape, width)?;
+        let mut shape = source.shape.clone();
+        let axis_len = shape[axis];
+        let block = block as u64;
+        shape[axis] = axis_len.div_ceil(block);
+        let layout = Layout::new(&shape, 8, "mean output")?;
+        let limit = self.file.0.limits.max_output_bytes;
+        check_limit(layout.len, limit, "mean output")?;
+        let dtype = DType {
+            kind: NumericType::F64,
+            byte_order: ByteOrder::Little,
+        };
+        if layout.len == 0 {
+            return Ok(Region {
+                shape,
+                dtype,
+                bytes: Vec::new(),
+            });
+        }
+
+        self.file.0.pool.run(|| {
+            let leading = 3 - shape.len();
+            let alignment = region::padded(&self.metadata.chunks, 1);
+            let extents = region::padded(&source.shape, 1);
+            let mut capacity = (limit.min(STAGING_BYTES) / width) as u64;
+            let mut lengths = [1; 3];
+            for index in (0..3).rev() {
+                lengths[index] = extents[index].min(capacity);
+                capacity /= lengths[index];
+            }
+            let cells = (lengths[0] * lengths[1] * lengths[2]) as usize;
+            let mut scratch = error::zeroed(cells * width)?;
+            let out = region::padded(&shape, 1).map(|size| size as usize);
+            let mut sums = Vec::new();
+            sums.try_reserve_exact(layout.len / 8)?;
+            sums.resize(layout.len / 8, 0.0);
+            let reducer = transform::MeanBins {
+                axis: leading + axis,
+                block,
+                shape: out,
+            };
+            let windows = |index: usize| {
+                region::windows(
+                    source.start[index]..source.end[index],
+                    lengths[index],
+                    alignment[index],
+                )
+            };
+            for z in windows(0) {
+                for y in windows(1) {
+                    for x in windows(2) {
+                        let window = [z.clone(), y.clone(), x];
+                        let selection =
+                            Selection::new(&window[leading..], &self.metadata.shape, width)?;
+                        let data = &mut scratch[..selection.output.len];
+                        self.read_selection(&selection, data)?;
+                        let offset = std::array::from_fn(|index| {
+                            selection.start[index] - source.start[index]
+                        });
+                        reducer.accumulate(
+                            &mut sums,
+                            data,
+                            self.metadata.dtype,
+                            region::padded(&selection.shape, 1).map(|size| size as usize),
+                            offset,
+                        );
+                    }
+                }
+            }
+            drop(scratch);
+            let mut bytes = error::zeroed(layout.len)?;
+            reducer.finish(sums, &mut bytes, axis_len);
+            Ok(Region {
+                shape,
+                dtype,
+                bytes,
+            })
         })
     }
 

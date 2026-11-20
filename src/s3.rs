@@ -4,13 +4,12 @@ use std::ffi::c_void;
 use std::io::Read;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::Mutex;
 use ureq::http::{header, HeaderValue, Response, Uri};
 use ureq::{Agent, Body};
 
-use crate::{error::zeroed, Error};
+use crate::{error::zeroed, s3_client::transport_error, Error, S3Client};
 
 const PAGE_SIZE: u64 = 64 * 1024;
 const METADATA_PAGES: usize = 16;
@@ -34,6 +33,8 @@ pub struct S3Options {
     pub prefetch_header: bool,
     /// Build a bounded chunk address index when opening a chunked dataset.
     pub preload_chunk_index: bool,
+    /// Share this client with other files at the same endpoint.
+    pub client: Option<S3Client>,
     refresh_url: Option<Arc<dyn Fn() -> Result<String, Error> + Send + Sync>>,
 }
 
@@ -45,6 +46,7 @@ impl Default for S3Options {
             max_gap_bytes: 0,
             prefetch_header: false,
             preload_chunk_index: false,
+            client: None,
             refresh_url: None,
         }
     }
@@ -67,7 +69,7 @@ pub(crate) fn take_callback_error() -> Option<Error> {
 }
 
 pub(crate) struct Object {
-    agent: Agent,
+    pub(crate) client: S3Client,
     url: Mutex<Uri>,
     refresh_lock: Mutex<()>,
     len: u64,
@@ -77,27 +79,22 @@ pub(crate) struct Object {
 }
 
 impl Object {
-    pub(crate) fn open(url: &str, connections: usize, options: S3Options) -> Result<Self, Error> {
+    pub(crate) fn open(url: &str, mut options: S3Options) -> Result<Self, Error> {
         if options.max_range_chunks == 0 || options.max_range_bytes == 0 {
             return Err(Error::InvalidRangeOptions);
         }
         let mut url = parse_url(url)?;
-        let agent: Agent = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .max_idle_connections(connections)
-            .max_idle_connections_per_host(connections)
-            .build()
-            .into();
+        let client = options.client.take().map_or_else(S3Client::shared, Ok)?;
+        let agent = client.agent();
         let probe = 0..if options.prefetch_header {
             PAGE_SIZE
         } else {
             1
         };
-        let mut response = match request(&agent, &url, probe.clone(), None) {
+        let mut response = match request(agent, &url, probe.clone(), None) {
             Err(Error::RemoteStatus(401 | 403)) if options.refresh_url.is_some() => {
                 url = refresh_url(&url, &options)?;
-                request(&agent, &url, probe.clone(), None)?
+                request(agent, &url, probe.clone(), None)?
             }
             other => other?,
         };
@@ -118,7 +115,7 @@ impl Object {
             metadata_pages.push_back((0, data));
         }
         Ok(Self {
-            agent,
+            client,
             url: Mutex::new(url),
             refresh_lock: Mutex::new(()),
             len,
@@ -144,10 +141,11 @@ impl Object {
             ))?;
         let range = start..end;
         let url = self.current_url();
-        let mut response = match request(&self.agent, &url, range.clone(), Some(&self.etag)) {
+        let agent = self.client.agent();
+        let mut response = match request(agent, &url, range.clone(), Some(&self.etag)) {
             Err(Error::RemoteStatus(401 | 403)) if self.options.refresh_url.is_some() => {
                 let next = self.renew_url(&url)?;
-                request(&self.agent, &next, range.clone(), Some(&self.etag))?
+                request(agent, &next, range.clone(), Some(&self.etag))?
             }
             other => other?,
         };
@@ -262,7 +260,7 @@ fn request(
     let response = request.call().map_err(|err| match err {
         ureq::Error::StatusCode(412) if etag.is_some() => Error::ObjectChanged,
         ureq::Error::StatusCode(status) => Error::RemoteStatus(status),
-        _ => Error::RemoteTransport,
+        other => transport_error(&other),
     })?;
     match response.status().as_u16() {
         206 => Ok(response),
@@ -326,7 +324,10 @@ pub(super) fn validate_range_headers(
 
 fn read_body(response: &mut Response<Body>, buffer: &mut [u8]) -> Result<(), Error> {
     let mut body = response.body_mut().as_reader();
-    let unreadable = |_| Error::InvalidRangeResponse("incomplete or unreadable HTTP body");
+    let unreadable = |error: std::io::Error| match transport_error(&error) {
+        Error::RemoteTransport => Error::InvalidRangeResponse("incomplete or unreadable HTTP body"),
+        classified => classified,
+    };
     body.read_exact(buffer).map_err(unreadable)?;
     if body.read(&mut [0]).map_err(unreadable)? != 0 {
         return Err(Error::InvalidRangeResponse("unexpected body length"));

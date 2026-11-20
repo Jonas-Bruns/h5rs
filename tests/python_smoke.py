@@ -40,6 +40,16 @@ def check_reads(file, array_2d, array_3d, *, use_index=False):
     pairs = cached.read_minmax((slice(0, 12), slice(4, 19)), block=3)
     bins = array_2d[0:12, 4:19].reshape(4, 3, 15)
     np.testing.assert_array_equal(pairs, np.stack((bins.min(axis=1), bins.max(axis=1)), axis=-1))
+    series = distance.read_mean(slice(5, 15), block=4)
+    np.testing.assert_array_equal(series, [6.5, 10.5, 13.5])
+    selection = (slice(6, 17), slice(2, 8), slice(4, 11))
+    values = array_3d[selection]
+    mean = second.read_mean(selection, block=3, axis=2)
+    np.testing.assert_allclose(
+        mean, np.stack([values[..., start:start + 3].mean(axis=2) for start in (0, 3, 6)], axis=-1)
+    )
+    assert distance.read_mean(slice(0, 0), block=2).shape == (0,)
+    np.testing.assert_array_equal(file["nan"].read_mean(slice(None), block=2), [np.nan, 6.0, 9.0])
 
 
 def main():
@@ -60,6 +70,7 @@ def main():
             )
             file.create_dataset("channel_3d", data=array_3d, chunks=(8, 4, 6))
             file.create_dataset("distance", data=np.arange(48, dtype=">i8"))
+            file.create_dataset("nan", data=np.array([1, np.nan, 5, 7, 9], dtype=">f4"), chunks=(2,))
         check_reads(h5rs.File(fixture, pool), array_2d, array_3d)
 
         server_script = Path(__file__).with_name("range_server.py")

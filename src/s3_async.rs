@@ -1,25 +1,123 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use http_body_util::{BodyExt, Empty};
 use hyper::body::{Bytes, Incoming};
 use hyper::{header, Request, Response};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::dns::{GaiAddrs, GaiResolver, Name};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tower_service::Service;
 use ureq::http::Uri;
 
 use crate::s3::{validate_range_headers, Object};
+use crate::s3_client::transport_error;
 use crate::{error::zeroed, Error};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type Connection = <HttpsConnector<HttpConnector<Dns>> as Service<Uri>>::Response;
+pub(crate) type HttpClient = Client<Connector, Empty<Bytes>>;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectFailure {
+    #[error("DNS resolution failed")]
+    Dns,
+    #[error("connection establishment timed out")]
+    Timeout,
+}
+
+impl ConnectFailure {
+    pub(crate) fn as_remote(&self) -> Error {
+        match self {
+            Self::Dns => Error::RemoteDns,
+            Self::Timeout => Error::RemoteTimeout("connection establishment"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Dns(GaiResolver);
+
+impl Service<Name> for Dns {
+    type Response = GaiAddrs;
+    type Error = ConnectFailure;
+    type Future = Pin<Box<dyn Future<Output = Result<GaiAddrs, ConnectFailure>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx).map_err(|_| ConnectFailure::Dns)
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let resolve = self.0.call(name);
+        Box::pin(async move { resolve.await.map_err(|_| ConnectFailure::Dns) })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Connector {
+    inner: HttpsConnector<HttpConnector<Dns>>,
+    timeout: Duration,
+}
+
+impl Service<Uri> for Connector {
+    type Response = Connection;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Connection, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let connection = self.inner.call(uri);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            tokio::time::timeout(timeout, connection)
+                .await
+                .map_err(|_| Box::new(ConnectFailure::Timeout) as BoxError)?
+        })
+    }
+}
+
+pub(crate) fn http_client(roots: Option<rustls::RootCertStore>, timeout: Duration) -> HttpClient {
+    let builder = HttpsConnectorBuilder::new();
+    let builder = match roots {
+        Some(roots) => builder.with_tls_config(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring supported protocols")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        ),
+        None => builder.with_webpki_roots(),
+    };
+    let mut tcp = HttpConnector::new_with_resolver(Dns(GaiResolver::new()));
+    tcp.enforce_http(false);
+    let connector = Connector {
+        inner: builder.https_or_http().enable_http1().wrap_connector(tcp),
+        timeout,
+    };
+    Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(64)
+        .pool_timer(TokioTimer::new())
+        .build(connector)
+}
 
 pub(crate) struct Transport {
     pub limit: usize,
     permits: Semaphore,
-    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     runtime: &'static Runtime,
 }
 
@@ -38,19 +136,9 @@ impl Transport {
             })
             .as_ref()
             .map_err(|_| Error::RemoteTransport)?;
-        let connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client = Client::builder(TokioExecutor::new())
-            .pool_max_idle_per_host(requests)
-            .pool_timer(TokioTimer::new())
-            .build(connector);
         Ok(Arc::new(Self {
             limit: requests,
             permits: Semaphore::new(requests),
-            client,
             runtime,
         }))
     }
@@ -94,13 +182,10 @@ impl Transport {
                         .acquire()
                         .await
                         .map_err(|_| Error::WorkerTerminated)?;
-                    tokio::time::timeout(
-                        Duration::from_secs(30),
-                        transport.get(&object, offset, size),
-                    )
-                    .await
-                    .map_err(|_| Error::RemoteTransport)?
-                    .map(|bytes| (index, bytes))
+                    transport
+                        .get(&object, offset, size)
+                        .await
+                        .map(|bytes| (index, bytes))
                 });
             }
             let Some(result) = requests.join_next().await else {
@@ -120,22 +205,51 @@ impl Transport {
             ))?;
         let range = offset..end;
         let url = object.current_url();
-        let mut response = match self.request(object, &url, &range).await {
+        match self.fetch(object, &url, &range, size).await {
             Err(Error::RemoteStatus(401 | 403)) if object.can_refresh() => {
                 let refresh_object = Arc::clone(object);
                 let url = tokio::task::spawn_blocking(move || refresh_object.renew_url(&url))
                     .await
                     .map_err(|_| Error::WorkerTerminated)??;
                 // The replacement identity is validated before reading any bytes.
-                self.request(object, &url, &range).await?
+                self.fetch(object, &url, &range, size).await
             }
-            other => other?,
-        };
+            other => other,
+        }
+    }
+
+    async fn fetch(
+        &self,
+        object: &Object,
+        url: &Uri,
+        range: &Range<u64>,
+        size: usize,
+    ) -> Result<Vec<u8>, Error> {
+        tokio::time::timeout(
+            object.client.request_timeout(),
+            self.fetch_body(object, url, range, size),
+        )
+        .await
+        .map_err(|_| Error::RemoteTimeout("HTTP request"))?
+    }
+
+    async fn fetch_body(
+        &self,
+        object: &Object,
+        url: &Uri,
+        range: &Range<u64>,
+        size: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let mut response = self.request(object, url, range).await?;
         let mut output = zeroed(size)?;
         let mut remaining = output.as_mut_slice();
         while let Some(frame) = response.body_mut().frame().await {
-            let frame = frame
-                .map_err(|_| Error::InvalidRangeResponse("incomplete or unreadable HTTP body"))?;
+            let frame = frame.map_err(|error| match transport_error(&error) {
+                Error::RemoteTransport => {
+                    Error::InvalidRangeResponse("incomplete or unreadable HTTP body")
+                }
+                classified => classified,
+            })?;
             let Ok(bytes) = frame.into_data() else {
                 continue;
             };
@@ -167,11 +281,17 @@ impl Transport {
             .header(header::ACCEPT_ENCODING, "identity")
             .body(Empty::new())
             .map_err(|_| Error::RemoteTransport)?;
-        let response = self
+        let response = object
             .client
+            .asynchronous()
             .request(request)
             .await
-            .map_err(|_| Error::RemoteTransport)?;
+            .map_err(|error| match transport_error(&error) {
+                Error::RemoteTransport if error.is_connect() => {
+                    Error::RemoteConnect("connection could not be established")
+                }
+                classified => classified,
+            })?;
         match response.status().as_u16() {
             206 => {}
             200 => {

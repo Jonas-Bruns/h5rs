@@ -185,7 +185,35 @@ To open a remote object, use `h5rs.File.open_s3(url, pool)` with a public
 or presigned HTTPS GET URL for your S3-compatible endpoint. Use the same
 dataset and slice API.
 
-### Viewer APIs (since 0.2.0)
+### S3 client settings and errors (since 0.2.1)
+
+Reuse an S3 client across files that share a TLS and timeout configuration.
+Python timeout values are in seconds. The request timeout applies to each
+GET attempt, including its response body.
+
+```python
+client = h5rs.S3Client(ca_bundle="/etc/certs/minio-ca.pem",
+                      connect_timeout=5.0, request_timeout=20.0)
+pool = h5rs.ReadPool(threads=8, concurrent_requests=8, max_s3_gets=32)
+files = h5rs.open_s3_many(urls, pool, client=client)
+file = h5rs.File.open_s3(url, pool, client=client, refresh_url=sign_get)
+```
+
+The explicit PEM bundle takes precedence over `SSL_CERT_FILE`, then
+`AWS_CA_BUNDLE`. A selected bundle supplies the trusted roots. The built-in
+WebPKI roots are used when all three are unset. Configure CA and timeouts
+directly on `File.open_s3` for a single file. Use a shared client for
+repeated opens with custom settings. Default opens share a client for the
+current environment trust settings. Synchronous and asynchronous HTTP
+each maintain their own connection pool, and each object retains its
+own ETag and URL-refresh settings.
+
+Remote failures are exposed as `h5rs.S3Error`, an `OSError` subclass.
+`kind` identifies errors such as `dns`, `tls`, `connect`, `timeout`,
+and `http`. `status_code` carries the unexpected HTTP status, if
+available. `reason` describes the cause without including signed URLs.
+
+### Viewer APIs
 
 ```python
 pool = h5rs.ReadPool(threads=8, concurrent_requests=8, max_s3_gets=32)
@@ -226,6 +254,22 @@ Steps, reverse slices and min/max operate on the bounding region. They
 reduce the returned array size. Min/max appends an axis of length two for
 the minimum and maximum of each bin, including the final partial bin.
 `dataset.read(selection, dtype="float32")` requests a float32 result.
+
+Since 0.2.1, `dataset.read_mean(selection, block=64, axis=0)` streams source windows
+for mean bins. The staging buffer is at most 8 MiB, plus the usual chunk
+scratch space and reduced arrays. Means use float64 accumulation and output,
+propagate NaNs and include the final partial bin. Bins are anchored at the
+start of the requested slice. For a continuous pyramid across files, align
+selections to the same logical bin boundaries or combine partial sums using
+their sample counts in the caller.
+
+Use the transport and mean benchmark to measure TLS handshakes and
+incremental peak memory with a local HTTPS fixture. It requires OpenSSL
+to generate a temporary test CA.
+
+```sh
+python benches/s3_mean.py target/s3-mean.json
+```
 
 Run the S3 viewer benchmark from a development environment. It uses two
 synthetic HDF5 files, five channels, a local HTTP Range server and a

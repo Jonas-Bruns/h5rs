@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "h5rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.85.1"
 description = "Read numeric HDF5 datasets from disk and S3"
@@ -14,8 +14,8 @@ readme = "README.md"
 exclude = ["**/__pycache__/**", "/python/h5rs/*.pdb", "/python/h5rs/*.pyd", "/python/h5rs/*.so"]
 
 [features]
-s3 = ["dep:cc", "dep:ureq"]
-s3-async-io = ["s3", "dep:http-body-util", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:tokio"]
+s3 = ["dep:cc", "dep:rustls", "dep:ureq"]
+s3-async-io = ["s3", "dep:http-body-util", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:tokio", "dep:tower-service"]
 simd-deflate = ["flate2/zlib-rs", "flate2/runtime_detection"]
 
 [[bench]]
@@ -31,6 +31,8 @@ parking_lot = "0.12"
 rayon = "1.10"
 thiserror = "2"
 ureq = { version = "3.1", default-features = false, features = ["rustls"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tower-service = { version = "0.3", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"], optional = true }

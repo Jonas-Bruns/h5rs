@@ -173,6 +173,25 @@ pub(crate) fn padded(shape: &[u64], leading: u64) -> [u64; 3] {
     normalized
 }
 
+pub(crate) fn windows(
+    range: Range<u64>,
+    length: u64,
+    alignment: u64,
+) -> impl Iterator<Item = Range<u64>> {
+    let mut start = range.start;
+    std::iter::from_fn(move || {
+        if start == range.end {
+            return None;
+        }
+        let mut end = start.saturating_add(length).min(range.end);
+        if end < range.end && length >= alignment {
+            end -= end % alignment;
+        }
+        let window = start..end;
+        start = end;
+        Some(window)
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

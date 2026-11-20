@@ -1,14 +1,57 @@
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use h5rs_core::{
-    ByteOrder, DType, Error, H5File, Limits, NumericType, ReadPool, Region, S3Options,
+    ByteOrder, DType, Error, H5File, Limits, NumericType, ReadPool, Region, S3Client,
+    S3ClientConfig, S3Options,
 };
 use numpy::IntoPyArray;
 use pyo3::exceptions::{PyIOError, PyIndexError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PySliceMethods, PyTuple};
 use rayon::prelude::*;
+
+pyo3::create_exception!(h5rs, S3Error, PyIOError);
+
+#[pyclass(name = "S3Client", module = "h5rs", frozen)]
+struct PythonS3Client(S3Client);
+
+#[pymethods]
+impl PythonS3Client {
+    #[new]
+    #[pyo3(signature = (*, ca_bundle=None, connect_timeout=30.0, request_timeout=30.0))]
+    fn new(
+        py: Python<'_>,
+        ca_bundle: Option<PathBuf>,
+        connect_timeout: f64,
+        request_timeout: f64,
+    ) -> PyResult<Self> {
+        let config = s3_config(ca_bundle, Some(connect_timeout), Some(request_timeout))?;
+        py.detach(|| S3Client::new(config))
+            .map(Self)
+            .map_err(python_error)
+    }
+}
+
+fn s3_config(
+    ca_bundle: Option<PathBuf>,
+    connect_timeout: Option<f64>,
+    request_timeout: Option<f64>,
+) -> PyResult<S3ClientConfig> {
+    let defaults = S3ClientConfig::default();
+    let duration = |seconds: Option<f64>, default: Duration| match seconds {
+        Some(seconds) => {
+            Duration::try_from_secs_f64(seconds).map_err(|_| python_error(Error::InvalidS3Timeout))
+        }
+        None => Ok(default),
+    };
+    Ok(S3ClientConfig {
+        ca_bundle,
+        connect_timeout: duration(connect_timeout, defaults.connect_timeout)?,
+        request_timeout: duration(request_timeout, defaults.request_timeout)?,
+    })
+}
 
 #[pyclass(name = "ReadPool", module = "h5rs", frozen)]
 struct PythonPool(ReadPool);
@@ -49,7 +92,7 @@ impl PythonFile {
 
     /// Open an immutable S3 object using a public or presigned HTTPS GET URL.
     #[staticmethod]
-    #[pyo3(signature = (url, pool=None, *, refresh_url=None, max_range_chunks=None, max_range_bytes=None, max_gap_bytes=0, prefetch_header=false, preload_chunk_index=false))]
+    #[pyo3(signature = (url, pool=None, *, refresh_url=None, max_range_chunks=None, max_range_bytes=None, max_gap_bytes=0, prefetch_header=false, preload_chunk_index=false, client=None, ca_bundle=None, connect_timeout=None, request_timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn open_s3(
         py: Python<'_>,
@@ -61,6 +104,10 @@ impl PythonFile {
         max_gap_bytes: usize,
         prefetch_header: bool,
         preload_chunk_index: bool,
+        client: Option<PyRef<'_, PythonS3Client>>,
+        ca_bundle: Option<PathBuf>,
+        connect_timeout: Option<f64>,
+        request_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let pool = pool.map(|pool| pool.0.clone());
         let mut options = S3Options::default();
@@ -69,15 +116,32 @@ impl PythonFile {
         options.max_gap_bytes = max_gap_bytes;
         options.prefetch_header = prefetch_header;
         options.preload_chunk_index = preload_chunk_index;
+        let config =
+            if ca_bundle.is_some() || connect_timeout.is_some() || request_timeout.is_some() {
+                if client.is_some() {
+                    return Err(PyValueError::new_err(
+                        "configure CA and timeouts on the supplied S3Client",
+                    ));
+                }
+                Some(s3_config(ca_bundle, connect_timeout, request_timeout)?)
+            } else {
+                None
+            };
+        options.client = client.map(|client| client.0.clone());
         if let Some(refresh) = refresh_url {
             options = options.with_url_refresh(move || {
                 Python::attach(|py| refresh.call0(py).and_then(|url| url.extract::<String>(py)))
                     .map_err(|_| Error::UrlRefresh)
             });
         }
-        py.detach(move || open_remote(url, pool, options))
-            .map(Self)
-            .map_err(python_error)
+        py.detach(move || {
+            if let Some(config) = config {
+                options.client = Some(S3Client::new(config)?);
+            }
+            open_remote(url, pool, options)
+        })
+        .map(Self)
+        .map_err(python_error)
     }
 
     /// Open an S3 dataset and build its chunk index in RAM.
@@ -173,6 +237,24 @@ impl PythonDataset {
             .map_err(python_error)?;
         numpy_region(py, result)
     }
+
+    #[pyo3(signature = (selection, block, *, axis=0))]
+    fn read_mean<'py>(
+        &self,
+        py: Python<'py>,
+        selection: &Bound<'py, PyAny>,
+        block: usize,
+        axis: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (ranges, steps) = parse_selection(selection, &self.0.metadata().shape)?;
+        if steps.iter().any(|step| *step != 1) {
+            return Err(PyValueError::new_err("mean requires step-1 slices"));
+        }
+        let result = py
+            .detach(|| self.0.read_mean(&ranges, axis, block))
+            .map_err(python_error)?;
+        numpy_region(py, result)
+    }
 }
 
 fn open_remote(url: &str, pool: Option<ReadPool>, options: S3Options) -> Result<H5File, Error> {
@@ -183,18 +265,20 @@ fn open_remote(url: &str, pool: Option<ReadPool>, options: S3Options) -> Result<
 }
 
 #[pyfunction]
-#[pyo3(signature = (urls, pool=None, *, prefetch_header=false, preload_chunk_index=false))]
+#[pyo3(signature = (urls, pool=None, *, prefetch_header=false, preload_chunk_index=false, client=None))]
 fn open_s3_many(
     py: Python<'_>,
     urls: Vec<String>,
     pool: Option<PyRef<'_, PythonPool>>,
     prefetch_header: bool,
     preload_chunk_index: bool,
+    client: Option<PyRef<'_, PythonS3Client>>,
 ) -> PyResult<Vec<PythonFile>> {
     let pool = pool.map(|pool| pool.0.clone());
     let mut options = S3Options::default();
     options.prefetch_header = prefetch_header;
     options.preload_chunk_index = preload_chunk_index;
+    options.client = client.map(|client| client.0.clone());
     py.detach(|| {
         urls.par_iter()
             .map(|url| open_remote(url, pool.clone(), options.clone()).map(PythonFile))
@@ -287,19 +371,46 @@ fn numpy_type(dtype: DType) -> String {
 
 fn python_error(error: Error) -> PyErr {
     let message = error.to_string();
-    match error {
-        Error::Unsupported(_) | Error::UnsupportedFilter(_) => {
-            PyNotImplementedError::new_err(message)
+    let (kind, status, reason) = match &error {
+        Error::CaBundle { reason, .. } => ("ca_bundle", None, *reason),
+        Error::RemoteDns => ("dns", None, "host lookup failed"),
+        Error::RemoteTls(reason) => ("tls", None, *reason),
+        Error::RemoteConnect(reason) => ("connect", None, *reason),
+        Error::RemoteTimeout(phase) => ("timeout", None, *phase),
+        Error::RemoteStatus(status) => ("http", Some(*status), "unexpected HTTP status"),
+        Error::InvalidRangeResponse(reason) => ("range_response", None, *reason),
+        Error::ObjectChanged => (
+            "object_changed",
+            None,
+            "object no longer matches its pinned identity",
+        ),
+        Error::RemoteTransport => ("transport", None, "HTTP transport failed"),
+        Error::UrlRefresh => ("url_refresh", None, "could not refresh the signed URL"),
+        _ => {
+            return match error {
+                Error::Unsupported(_) | Error::UnsupportedFilter(_) => {
+                    PyNotImplementedError::new_err(message)
+                }
+                Error::SelectionRank { .. } | Error::SelectionBounds { .. } => {
+                    PyIndexError::new_err(message)
+                }
+                Error::InvalidName
+                | Error::InvalidConcurrency
+                | Error::InvalidTransform
+                | Error::InvalidS3Timeout
+                | Error::InvalidRangeOptions => PyValueError::new_err(message),
+                _ => PyIOError::new_err(message),
+            }
         }
-        Error::SelectionRank { .. } | Error::SelectionBounds { .. } => {
-            PyIndexError::new_err(message)
-        }
-        Error::InvalidName
-        | Error::InvalidConcurrency
-        | Error::InvalidTransform
-        | Error::InvalidRangeOptions => PyValueError::new_err(message),
-        _ => PyIOError::new_err(message),
-    }
+    };
+    let error = S3Error::new_err(message);
+    let _ = Python::attach(|py| {
+        let value = error.value(py);
+        value.setattr("kind", kind)?;
+        value.setattr("status_code", status)?;
+        value.setattr("reason", reason)
+    });
+    error
 }
 
 #[pymodule]
@@ -307,6 +418,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonPool>()?;
     module.add_class::<PythonFile>()?;
     module.add_class::<PythonDataset>()?;
+    module.add_class::<PythonS3Client>()?;
+    module.add("S3Error", module.py().get_type::<S3Error>())?;
     module.add_function(wrap_pyfunction!(open_s3_many, module)?)?;
     module.add_function(wrap_pyfunction!(read_many, module)?)?;
     Ok(())

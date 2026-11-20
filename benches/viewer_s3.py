@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import random
 from statistics import median, quantiles
+import sys
 from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 from time import perf_counter, sleep
@@ -69,6 +70,10 @@ class Server(ThreadingHTTPServer):
     def reset(self):
         with self.lock:
             self.stats = dict(gets=0, bytes=0, peak=0, rejected=0)
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
 
 
 class RangeHandler(BaseHTTPRequestHandler):
