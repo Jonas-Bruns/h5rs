@@ -338,6 +338,22 @@ impl Dataset {
         self.read_transformed(ranges, steps, false)
     }
 
+    /// Read a packed strided region away from the caller's async executor.
+    pub async fn read_strided_async(
+        &self,
+        ranges: &[Range<u64>],
+        steps: &[isize],
+    ) -> Result<Region, Error> {
+        let selection = self.strided_selection(ranges, steps)?;
+        let dataset = self.clone();
+        let steps = steps.to_vec();
+        self.file
+            .0
+            .pool
+            .submit(move || transform::stride(dataset.read_owned(selection)?, &steps))
+            .await
+    }
+
     /// Read a packed strided region, converting the selected values to float32.
     pub fn read_f32(&self, ranges: &[Range<u64>], steps: &[isize]) -> Result<Region, Error> {
         self.read_transformed(ranges, steps, true)
@@ -349,10 +365,7 @@ impl Dataset {
         steps: &[isize],
         cast: bool,
     ) -> Result<Region, Error> {
-        if ranges.len() != steps.len() || steps.contains(&0) {
-            return Err(Error::InvalidTransform);
-        }
-        let selection = self.selection(ranges)?;
+        let selection = self.strided_selection(ranges, steps)?;
         self.file.0.pool.run(|| {
             let region = transform::stride(self.read_owned(selection)?, steps)?;
             if !cast
@@ -368,6 +381,17 @@ impl Dataset {
             check_limit(size, self.file.0.limits.max_output_bytes, "float32 output")?;
             Ok(transform::f32(region, error::zeroed(size)?))
         })
+    }
+
+    fn strided_selection(
+        &self,
+        ranges: &[Range<u64>],
+        steps: &[isize],
+    ) -> Result<Selection, Error> {
+        if ranges.len() != steps.len() || steps.contains(&0) {
+            return Err(Error::InvalidTransform);
+        }
+        self.selection(ranges)
     }
 
     /// Reduce fixed-size bins along one axis. The last output axis contains

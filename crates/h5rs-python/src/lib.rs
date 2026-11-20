@@ -223,10 +223,10 @@ fn read_many<'py>(
         })
         .collect::<PyResult<Vec<_>>>()?;
     let results = py.detach(|| {
-        requests
-            .par_iter()
-            .map(|(dataset, (ranges, steps))| dataset.read_strided(ranges, steps))
-            .collect::<Vec<_>>()
+        // Await each pool's admission permit without blocking a Rayon worker.
+        pollster::block_on(futures_util::future::join_all(requests.iter().map(
+            |(dataset, (ranges, steps))| dataset.read_strided_async(ranges, steps),
+        )))
     });
     results
         .into_iter()

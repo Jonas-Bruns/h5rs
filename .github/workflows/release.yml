@@ -46,7 +46,11 @@ jobs:
           python -m pip install "maturin==1.16.0" "cmake>=3.26" "h5py>=3.16,<4"
           maturin sdist --out dist
           python -m pip install --no-build-isolation dist/*.tar.gz
-          python tests/python_smoke.py
+      - name: Test source installation
+        timeout-minutes: 2
+        env:
+          RAYON_NUM_THREADS: '2'
+        run: python tests/python_smoke.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-source
@@ -88,6 +92,9 @@ jobs:
           python -m pip install "maturin==1.16.0" "cmake>=3.26"
           maturin build --release --locked --compatibility pypi --target ${{ matrix.platform.target }} --interpreter python --out dist
       - name: Test installed wheel
+        timeout-minutes: 2
+        env:
+          RAYON_NUM_THREADS: '2'
         shell: python
         run: |
           from pathlib import Path
