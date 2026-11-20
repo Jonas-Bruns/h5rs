@@ -71,15 +71,26 @@ impl ChunkIndex {
                 .min(max_entries);
             let additional = capacity - self.entries.len();
             let bytes = additional * size_of::<ChunkEntry>();
-            INDEX_BYTES
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    (bytes <= MAX_INDEX_BYTES - used).then_some(used + bytes)
-                })
-                .map_err(|used| Error::Limit {
-                    kind: "process chunk address indexes",
-                    bytes: used + bytes,
-                    limit: MAX_INDEX_BYTES,
-                })?;
+            let mut used = INDEX_BYTES.load(Ordering::Relaxed);
+            loop {
+                let requested = used + bytes;
+                if requested > MAX_INDEX_BYTES {
+                    return Err(Error::Limit {
+                        kind: "process chunk address indexes",
+                        bytes: requested,
+                        limit: MAX_INDEX_BYTES,
+                    });
+                }
+                match INDEX_BYTES.compare_exchange_weak(
+                    used,
+                    requested,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => used = current,
+                }
+            }
             if let Err(error) = self.entries.try_reserve_exact(additional) {
                 INDEX_BYTES.fetch_sub(bytes, Ordering::Relaxed);
                 return Err(error.into());
