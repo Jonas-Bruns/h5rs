@@ -1,8 +1,10 @@
 use std::ops::Range;
 
+use rayon::prelude::*;
+
 use crate::Error;
 
-/// Row-major byte strides, using a virtual leading axis of length 1 for 2D.
+/// Row-major byte strides with virtual leading axes of length one.
 #[derive(Clone, Copy)]
 pub(crate) struct Layout {
     row: usize,
@@ -45,6 +47,34 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
+    pub(crate) fn read_contiguous(
+        &self,
+        source: Layout,
+        shape: [u64; 3],
+        item_size: usize,
+        output: &mut [u8],
+        read: impl Fn(usize, &mut [u8]) -> Result<(), Error> + Sync,
+    ) -> Result<(), Error> {
+        let [z, y, x] = self.start.map(|value| value as usize);
+        let column = x * item_size;
+        let rows = (self.end[1] - self.start[1]) as usize;
+        if self.output.plane == source.plane {
+            return read(source.offset(z, 0, 0), output);
+        }
+        if self.output.row == shape[2] as usize * item_size {
+            return output
+                .par_chunks_mut(self.output.plane)
+                .enumerate()
+                .try_for_each(|(plane, bytes)| read(source.offset(z + plane, y, 0), bytes));
+        }
+        output
+            .par_chunks_mut(self.output.row)
+            .enumerate()
+            .try_for_each(|(row, bytes)| {
+                read(source.offset(z + row / rows, y + row % rows, column), bytes)
+            })
+    }
+
     pub(crate) fn chunk_origins(&self, chunks: [u64; 3]) -> impl Iterator<Item = [u64; 3]> {
         let first = std::array::from_fn::<_, 3, _>(|axis| self.start[axis] / chunks[axis]);
         let last = std::array::from_fn::<_, 3, _>(|axis| (self.end[axis] - 1) / chunks[axis]);

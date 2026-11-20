@@ -20,6 +20,10 @@ def check_reads(file, array_2d, array_3d, *, use_index=False):
     assert first.shape == array_2d.shape
     assert first.chunks == (8, 8)
     assert second.dtype == array_3d.dtype
+    distance = file["distance"]
+    assert distance.chunks is None
+    np.testing.assert_array_equal(distance[34:3:-4], np.arange(48)[34:3:-4])
+    assert distance.read(slice(0, 12), dtype="float32").dtype == np.dtype("float32")
     with ThreadPoolExecutor(max_workers=2) as executor:
         tile_2d = executor.submit(first.__getitem__, (slice(5, 27), slice(3, 26)))
         tile_3d = executor.submit(
@@ -27,6 +31,15 @@ def check_reads(file, array_2d, array_3d, *, use_index=False):
         )
         np.testing.assert_array_equal(tile_2d.result(), array_2d[5:27, 3:26])
         np.testing.assert_array_equal(tile_3d.result(), array_3d[6:30, 1:7, 2:11])
+    cached = first.with_chunk_cache(8 * 8 * 4 * 4)
+    batch = h5rs.read_many([(cached, (slice(0, 12), slice(4, 19))), (distance, slice(2, 21, 3)),
+                            (cached, (slice(3, 17), slice(4, 19)))])
+    np.testing.assert_array_equal(batch[0], array_2d[0:12, 4:19])
+    np.testing.assert_array_equal(batch[1], np.arange(48)[2:21:3])
+    np.testing.assert_array_equal(batch[2], array_2d[3:17, 4:19])
+    pairs = cached.read_minmax((slice(0, 12), slice(4, 19)), block=3)
+    bins = array_2d[0:12, 4:19].reshape(4, 3, 15)
+    np.testing.assert_array_equal(pairs, np.stack((bins.min(axis=1), bins.max(axis=1)), axis=-1))
 
 
 def main():
@@ -46,6 +59,7 @@ def main():
                 shuffle=True,
             )
             file.create_dataset("channel_3d", data=array_3d, chunks=(8, 4, 6))
+            file.create_dataset("distance", data=np.arange(48, dtype=">i8"))
         check_reads(h5rs.File(fixture, pool), array_2d, array_3d)
 
         server_script = Path(__file__).with_name("range_server.py")
@@ -62,7 +76,9 @@ def main():
                     if not port:
                         time.sleep(0.025)
                 url = f"http://127.0.0.1:{port}/reference.h5"
-                check_reads(h5rs.File.open_s3(url, pool), array_2d, array_3d, use_index=True)
+                check_reads(h5rs.File.open_s3(url, pool, max_gap_bytes=1024), array_2d, array_3d, use_index=True)
+                async_pool = h5rs.ReadPool(threads=2, concurrent_requests=2, max_s3_gets=8)
+                check_reads(h5rs.File.open_s3(url, async_pool), array_2d, array_3d, use_index=True)
             finally:
                 server.terminate()
     print("Installed h5rs passed local and S3-style reads")

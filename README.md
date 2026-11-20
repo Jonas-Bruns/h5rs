@@ -1,9 +1,9 @@
 # h5rs
 
-`h5rs` reads rectangular regions of chunked HDF5 datasets in immutable local
+`h5rs` reads rectangular regions of numeric HDF5 datasets in immutable local
 files and S3 objects. The bundled HDF5 C library handles metadata and chunk
-locations. Rust reads stored chunks by offset, reverses their filters and copies
-the intersecting rows into the output.
+locations. Rust reads stored chunks and contiguous spans by offset. It reverses
+chunk filters and copies the intersecting rows into the output.
 
 ## Rust API
 
@@ -119,8 +119,8 @@ S3 reader keeps checking the object's ETag on data reads.
 | Feature | Baseline support |
 | --- | --- |
 | File access | Read-only local files via native VOL and sec2, plus S3 HTTPS range reads with the `s3` feature. Local files and paths must remain stable while open. |
-| Layout | Chunked 2D and 3D datasets with default chunk options, including clipped edge chunks. |
-| Selections | One half-open, unit-stride range per axis. Empty selections preserve their shape. |
+| Layout | Numeric 1D, 2D and 3D datasets. Chunked with default chunk options, contiguous in the HDF5 file, and compact. |
+| Selections | One half-open range per axis. Strided reads accept positive or negative steps. Empty selections preserve their shape. |
 | Types | Signed and unsigned 8-, 16-, 32- and 64-bit integers, plus IEEE float32 and float64, with little- and big-endian encodings. |
 | Filters | No filters, Shuffle, Deflate (HDF5 gzip), or Shuffle followed by Deflate. Decoding honors each chunk's filter mask. |
 | Missing chunks | Default and user-defined fill values with allocation or if-set fill timing. |
@@ -149,12 +149,12 @@ cargo test --locked --all-features -- --include-ignored
 ```
 
 The test generates small fixtures and compares output shape, datatype,
-byte order and every byte against h5py across 86 selections. It also checks
+byte order and every byte against h5py across 94 selections. It also checks
 concurrent requests, corrupt chunks, truncated files and unsupported features.
 
 ## Python
 
-Install the published wheel once version 0.1.0 is on PyPI.
+Install the published wheel from PyPI.
 
 ```sh
 python -m pip install h5rs
@@ -178,12 +178,63 @@ file = h5rs.File("distance_000.h5", pool)
 tile = file["channel_0"][100:612, 0:512]
 ```
 
-The Python reader accepts one unit-stride slice per axis and returns a NumPy
+The Python reader accepts one slice per axis and returns a NumPy
 view backed by the Rust output allocation. It releases the Python interpreter
 while opening files, obtaining dataset metadata and reading regions.
 To open a remote object, use `h5rs.File.open_s3(url, pool)` with a public
 or presigned HTTPS GET URL for your S3-compatible endpoint. Use the same
 dataset and slice API.
+
+### Viewer APIs (since 0.2.0)
+
+```python
+pool = h5rs.ReadPool(threads=8, concurrent_requests=8, max_s3_gets=32)
+file = h5rs.File.open_s3(
+    sign_get(), pool, refresh_url=sign_get,
+    prefetch_header=True, preload_chunk_index=True, max_gap_bytes=128 * 1024,
+)
+distance = file["distance"][1000:1500]
+channel = file["channel_0"].with_chunk_cache(24 * 1024**2)
+tile, overview = h5rs.read_many([
+    (channel, (slice(1000, 1500), slice(0, 512))),
+    (channel, (slice(1500, 2000, 4), slice(0, 512))),
+])
+envelope = channel.read_minmax((slice(1000, 1500), slice(0, 512)), block=8)
+```
+
+`sign_get` supplies a fresh URL for the same object path. The callback can run
+on a worker thread. Keep it independent of h5rs. When a GET receives HTTP 401
+or 403, reads sharing the handle reuse a refreshed URL and retry once. The
+object size and ETag remain pinned. Credential discovery and URL signing
+stay with the caller. Both path-style and virtual-hosted HTTPS URLs work
+when the endpoint supports conditional byte ranges.
+
+`max_s3_gets` enables the async HTTP transport for chunks (the
+`s3-async-io` Cargo feature). The limit is shared by files using the same
+pool. A worker coordinates each batch, and CPU workers decode the results.
+HDF5 metadata reads and contiguous spans use the synchronous transport.
+Use `open_s3_many` when opening several URLs together. Chunk index preloading
+occurs when each dataset is opened and falls back to on-demand lookup if the
+RAM budget is reached. Header prefetch and index preloading are independent.
+
+The decoded cache is opt-in and bounded per dataset handle. Clones of a
+cached handle share its entries. Reuse the handle to get cache hits. Range
+grouping limits `max_range_chunks`, `max_range_bytes` and `max_gap_bytes`
+allow extra bytes to be traded for fewer requests. Gaps default to zero.
+
+Steps, reverse slices and min/max operate on the bounding region. They
+reduce the returned array size. Min/max appends an axis of length two for
+the minimum and maximum of each bin, including the final partial bin.
+`dataset.read(selection, dtype="float32")` requests a float32 result.
+
+Run the S3 viewer benchmark from a development environment. It uses two
+synthetic HDF5 files, five channels, a local HTTP Range server and a
+configurable delay on each response. The trace measures independent
+optimizations and three concurrent viewers sharing handles.
+
+```sh
+python benches/viewer_s3.py target/viewer-s3.json --frames 12 --delay-ms 3
+```
 
 The GitHub and PyPI release procedure is in `RELEASE.md` in the repository.
 

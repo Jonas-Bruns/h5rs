@@ -15,6 +15,12 @@ pub enum Error {
     #[error("invalid S3 object URL; use HTTPS or a loopback HTTP endpoint")]
     InvalidObjectUrl,
     #[cfg(feature = "s3")]
+    #[error("invalid S3 range grouping limits")]
+    InvalidRangeOptions,
+    #[cfg(feature = "s3")]
+    #[error("S3 URL refresh failed or returned a different endpoint or path")]
+    UrlRefresh,
+    #[cfg(feature = "s3")]
     #[error("S3 range request failed (HTTP {0})")]
     RemoteStatus(u16),
     #[cfg(feature = "s3")]
@@ -43,6 +49,8 @@ pub enum Error {
         end: u64,
         extent: u64,
     },
+    #[error("invalid stride, reduction axis or block size")]
+    InvalidTransform,
     #[error("expected an output buffer of {expected} bytes, got {actual}")]
     OutputLength { expected: usize, actual: usize },
     #[error("size overflow computing {0}")]

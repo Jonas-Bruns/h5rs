@@ -210,6 +210,22 @@ fn s3_ranges_read_hdf5_and_overlap() {
     );
 
     let ranges = [1..10, 2..16];
+    for (name, ranges) in [
+        ("distance", std::iter::once(7..291).collect()),
+        ("distance-chunked", std::iter::once(30..257).collect()),
+        ("contiguous-fill", std::iter::once(5..35).collect()),
+        ("contiguous", vec![1..9, 2..13]),
+        ("compact", vec![0..3, 1..3]),
+    ] {
+        let local = H5File::open(fixtures.0.join("reference.h5")).unwrap();
+        let expected = local.dataset(name).unwrap().read_region(&ranges).unwrap();
+        let actual = first
+            .dataset_with_s3_index(name)
+            .unwrap()
+            .read_region(&ranges)
+            .unwrap();
+        assert_eq!(actual.bytes, expected.bytes, "{name}");
+    }
     let expected = raw.read_region(&ranges).unwrap().bytes;
     let indexed = first.dataset_with_s3_index("raw").unwrap();
     for _ in 0..2 {
@@ -272,7 +288,7 @@ impl Drop for RangeServer {
 }
 
 fn assert_errors(path: &Path, file: &H5File) {
-    for name in ["text", "contiguous", "rank4", "never"] {
+    for name in ["text", "rank4", "never"] {
         assert!(
             matches!(file.dataset(name), Err(Error::Unsupported(_))),
             "{name}"
@@ -377,6 +393,9 @@ fn assert_concurrent_reads(file: &H5File, latest: &H5File) {
 }
 
 fn dimensions(field: &str) -> Vec<u64> {
+    if field.is_empty() {
+        return Vec::new();
+    }
     field
         .split(',')
         .map(|value| value.parse().unwrap())

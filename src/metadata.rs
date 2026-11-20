@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use hdf5_metno_sys::h5::{herr_t, H5open, HADDR_UNDEF};
-use hdf5_metno_sys::h5d::{H5D_fill_time_t::*, H5D_fill_value_t::*, H5D_layout_t::*, *};
+use hdf5_metno_sys::h5d::{
+    H5D_fill_time_t::*, H5D_fill_value_t::*, H5D_layout_t::*, H5D_space_status_t::*, *,
+};
 use hdf5_metno_sys::h5e::{H5E_auto2_t, H5Eget_auto2, H5Eset_auto2, H5E_DEFAULT};
 use hdf5_metno_sys::h5f::{H5Fclose, H5Fget_access_plist, H5Fopen, H5F_ACC_RDONLY};
 use hdf5_metno_sys::h5i::hid_t;
 use hdf5_metno_sys::h5p::*;
-use hdf5_metno_sys::h5s::{H5Sclose, H5Sget_simple_extent_dims, H5Sget_simple_extent_ndims};
+use hdf5_metno_sys::h5s::{
+    H5Sclose, H5Sget_simple_extent_dims, H5Sget_simple_extent_ndims, H5S_ALL,
+};
 use hdf5_metno_sys::h5t::*;
 use hdf5_metno_sys::h5vl::H5VLget_connector_name;
 use hdf5_metno_sys::h5z::{H5Z_FILTER_DEFLATE, H5Z_FILTER_SHUFFLE};
@@ -28,6 +32,14 @@ pub(crate) struct Dataset {
     id: Id,
     rank: usize,
     index: OnceLock<Option<ChunkIndex>>,
+    pub storage: Storage,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Storage {
+    Chunked,
+    Contiguous(Option<u64>),
+    Compact,
 }
 
 #[derive(Clone, Copy)]
@@ -196,13 +208,14 @@ impl File {
                     H5Dclose,
                     "open dataset",
                 )?;
-                let metadata = dataset_metadata(id.raw)?;
+                let (metadata, storage) = dataset_metadata(id.raw)?;
                 let rank = metadata.shape.len();
                 Ok((
                     Dataset {
                         id,
                         rank,
                         index: OnceLock::new(),
+                        storage,
                     },
                     metadata,
                 ))
@@ -217,6 +230,28 @@ extern "C" {
 }
 
 impl Dataset {
+    pub(crate) fn read_compact(&self, output: &mut [u8]) -> Result<(), Error> {
+        with_hdf5(|| {
+            // SAFETY: The live compact dataset is read into a buffer sized for
+            // its full shape and exact file datatype by the caller.
+            unsafe {
+                let datatype = Id::new(H5Dget_type(self.id.raw), H5Tclose, "get datatype")?;
+                check(
+                    H5Dread(
+                        self.id.raw,
+                        datatype.raw,
+                        H5S_ALL,
+                        H5S_ALL,
+                        H5P_DEFAULT,
+                        output.as_mut_ptr().cast(),
+                    ),
+                    "read compact dataset",
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn location_index(&self) -> Option<&ChunkIndex> {
         // Concurrent first reads share a single initialization. Remember when
         // discovery is unavailable so later reads can fall back immediately.
@@ -228,6 +263,9 @@ impl Dataset {
     #[cfg(feature = "s3")]
     pub(crate) fn prepare_s3_index(&self) -> Result<(), Error> {
         // Called on a fresh dataset before sharing the handle with readers.
+        if self.index.get().is_some() {
+            return Ok(());
+        }
         let index = self.build_index(MAX_INDEX_BYTES / size_of::<ChunkEntry>())?;
         let _ = self.index.set(Some(index));
         Ok(())
@@ -365,15 +403,15 @@ extern "C" fn reject_external_link(
 }
 
 // The caller holds HDF5 and owns a live dataset ID.
-unsafe fn dataset_metadata(dataset: hid_t) -> Result<DatasetMetadata, Error> {
+unsafe fn dataset_metadata(dataset: hid_t) -> Result<(DatasetMetadata, Storage), Error> {
     // SAFETY: Each obtained ID is checked before use. The rank is validated
     // before either dimension query, and fill is read only for 1–8 byte types.
     unsafe {
         let space = Id::new(H5Dget_space(dataset), H5Sclose, "get dataspace")?;
         let rank = H5Sget_simple_extent_ndims(space.raw);
         check(rank, "get dataset rank")?;
-        if !matches!(rank, 2 | 3) {
-            return Err(Error::Unsupported("dataset rank other than 2 or 3"));
+        if !matches!(rank, 1..=3) {
+            return Err(Error::Unsupported("dataset rank outside 1 through 3"));
         }
         let mut shape = vec![0; rank as usize];
         check(
@@ -390,21 +428,51 @@ unsafe fn dataset_metadata(dataset: hid_t) -> Result<DatasetMetadata, Error> {
         if layout == H5D_LAYOUT_ERROR {
             return Err(Error::Hdf5("get dataset layout"));
         }
-        if layout != H5D_CHUNKED {
-            return Err(Error::Unsupported("non-chunked layout"));
-        }
-        let mut chunks = vec![0; rank as usize];
-        if H5Pget_chunk(properties.raw, rank, chunks.as_mut_ptr()) != rank || chunks.contains(&0) {
-            return Err(Error::Hdf5("get chunk dimensions"));
-        }
-        let mut options = 0;
-        check(
-            H5Pget_chunk_opts(properties.raw, &mut options),
-            "get chunk options",
-        )?;
-        if options != 0 {
-            return Err(Error::Unsupported("non-default chunk options"));
-        }
+        let mut chunks = Vec::new();
+        let storage = match layout {
+            H5D_CHUNKED => {
+                chunks.resize(rank as usize, 0);
+                if H5Pget_chunk(properties.raw, rank, chunks.as_mut_ptr()) != rank
+                    || chunks.contains(&0)
+                {
+                    return Err(Error::Hdf5("get chunk dimensions"));
+                }
+                let mut options = 0;
+                check(
+                    H5Pget_chunk_opts(properties.raw, &mut options),
+                    "get chunk options",
+                )?;
+                if options != 0 {
+                    return Err(Error::Unsupported("non-default chunk options"));
+                }
+                Storage::Chunked
+            }
+            H5D_CONTIGUOUS => {
+                if check(
+                    H5Pget_external_count(properties.raw),
+                    "get external storage count",
+                )? != 0
+                {
+                    return Err(Error::Unsupported("external dataset storage"));
+                }
+                let mut status = H5D_SPACE_STATUS_ERROR;
+                check(
+                    H5Dget_space_status(dataset, &mut status),
+                    "get allocation status",
+                )?;
+                if status == H5D_SPACE_STATUS_NOT_ALLOCATED {
+                    Storage::Contiguous(None)
+                } else {
+                    let offset = H5Dget_offset(dataset);
+                    if offset == HADDR_UNDEF {
+                        return Err(Error::Hdf5("get contiguous offset"));
+                    }
+                    Storage::Contiguous(Some(offset))
+                }
+            }
+            H5D_COMPACT => Storage::Compact,
+            _ => return Err(Error::Unsupported("dataset layout")),
+        };
 
         let datatype = Id::new(H5Dget_type(dataset), H5Tclose, "get datatype")?;
         let dtype = numeric_type(datatype.raw)?;
@@ -431,13 +499,16 @@ unsafe fn dataset_metadata(dataset: hid_t) -> Result<DatasetMetadata, Error> {
             H5Pget_fill_value(properties.raw, datatype.raw, fill_value.as_mut_ptr().cast()),
             "get fill value",
         )?;
-        Ok(DatasetMetadata {
-            shape,
-            chunks,
-            dtype,
-            filters,
-            fill_value,
-        })
+        Ok((
+            DatasetMetadata {
+                shape,
+                chunks,
+                dtype,
+                filters,
+                fill_value,
+            },
+            storage,
+        ))
     }
 }
 

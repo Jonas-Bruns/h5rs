@@ -13,6 +13,8 @@ pub struct ReadPool(Arc<Inner>);
 struct Inner {
     workers: ThreadPool,
     permits: Arc<Semaphore>,
+    #[cfg(feature = "s3-async-io")]
+    transport: Option<Arc<crate::s3_async::Transport>>,
 }
 
 impl ReadPool {
@@ -29,7 +31,29 @@ impl ReadPool {
         Ok(Self(Arc::new(Inner {
             workers,
             permits: Arc::new(Semaphore::new(concurrent_requests)),
+            #[cfg(feature = "s3-async-io")]
+            transport: None,
         })))
+    }
+
+    /// Limit simultaneous asynchronous data GETs across all S3 handles using
+    /// this pool. HDF5 metadata continues to use synchronous I/O.
+    #[cfg(feature = "s3-async-io")]
+    pub fn with_s3_io(
+        threads: usize,
+        concurrent_requests: usize,
+        max_s3_gets: usize,
+    ) -> Result<Self, Error> {
+        let mut pool = Self::new(threads, concurrent_requests)?;
+        Arc::get_mut(&mut pool.0)
+            .expect("new pool has one owner")
+            .transport = Some(crate::s3_async::Transport::new(max_s3_gets)?);
+        Ok(pool)
+    }
+
+    #[cfg(feature = "s3-async-io")]
+    pub(crate) fn s3_transport(&self) -> Option<&Arc<crate::s3_async::Transport>> {
+        self.0.transport.as_ref()
     }
 
     pub(crate) fn shared() -> Result<Self, Error> {

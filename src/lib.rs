@@ -1,8 +1,9 @@
-//! Parallel read-only access to chunked HDF5 datasets.
+//! Parallel read-only access to numeric HDF5 datasets.
 //!
 //! Dataset handles can be shared between threads. Data I/O and filter decoding
 //! run on a bounded worker pool outside the process-wide HDF5 metadata lock.
 
+mod cache;
 mod error;
 mod filters;
 mod metadata;
@@ -11,6 +12,9 @@ mod raw;
 mod region;
 #[cfg(feature = "s3")]
 mod s3;
+#[cfg(feature = "s3-async-io")]
+mod s3_async;
+mod transform;
 
 use std::borrow::Cow;
 use std::ffi::CString;
@@ -25,6 +29,8 @@ use metadata::ChunkLocation;
 pub use pool::ReadPool;
 use raw::RawFile;
 use region::{Layout, Selection};
+#[cfg(feature = "s3")]
+pub use s3::S3Options;
 
 /// Primitive numeric types with standard HDF5 binary representations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +90,7 @@ pub enum Filter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetMetadata {
     pub shape: Vec<u64>,
+    /// Chunk dimensions, or an empty vector for contiguous and compact storage.
     pub chunks: Vec<u64>,
     pub dtype: DType,
     /// Filters in write order. Individual chunks may skip filters.
@@ -183,13 +190,30 @@ impl H5File {
     /// range response must provide a strong ETag for subsequent reads.
     #[cfg(feature = "s3")]
     pub fn open_s3(url: &str) -> Result<Self, Error> {
-        Self::open_s3_with_pool(url, Limits::default(), ReadPool::shared()?)
+        Self::open_s3_with_defaults(url, S3Options::default())
+    }
+
+    /// Open a remote file with the default worker pool and memory limits.
+    #[cfg(feature = "s3")]
+    pub fn open_s3_with_defaults(url: &str, options: S3Options) -> Result<Self, Error> {
+        Self::open_s3_with_options(url, Limits::default(), ReadPool::shared()?, options)
     }
 
     /// Open an S3 object using a caller-provided pool and memory limits.
     #[cfg(feature = "s3")]
     pub fn open_s3_with_pool(url: &str, limits: Limits, pool: ReadPool) -> Result<Self, Error> {
-        let object = Arc::new(s3::Object::open(url, pool.threads())?);
+        Self::open_s3_with_options(url, limits, pool, S3Options::default())
+    }
+
+    /// Open a remote file with configurable range grouping and URL renewal.
+    #[cfg(feature = "s3")]
+    pub fn open_s3_with_options(
+        url: &str,
+        limits: Limits,
+        pool: ReadPool,
+        options: S3Options,
+    ) -> Result<Self, Error> {
+        let object = Arc::new(s3::Object::open(url, pool.threads(), options)?);
         // SAFETY: raw stores the Arc for at least as long as the HDF5 file.
         // The dataset handle is likewise dropped before its file reference.
         let metadata = unsafe { metadata::File::open_s3(&object)? };
@@ -214,14 +238,33 @@ impl H5File {
     pub fn dataset(&self, name: &str) -> Result<Dataset, Error> {
         let name = CString::new(name).map_err(|_| Error::InvalidName)?;
         let (handle, metadata) = self.0.metadata.dataset(&name)?;
-        let chunk = Layout::new(&metadata.chunks, metadata.dtype.size(), "decoded chunk")?;
-        check_limit(chunk.len, self.0.limits.max_chunk_bytes, "decoded chunk")?;
-        Ok(Dataset {
+        let storage_shape = match handle.storage {
+            metadata::Storage::Chunked => &metadata.chunks,
+            _ => &metadata.shape,
+        };
+        let chunk = Layout::new(storage_shape, metadata.dtype.size(), "dataset storage")?;
+        if !matches!(handle.storage, metadata::Storage::Contiguous(_)) {
+            check_limit(chunk.len, self.0.limits.max_chunk_bytes, "decoded chunk")?;
+        }
+        let dataset = Dataset {
             handle: Arc::new(handle),
             file: self.clone(),
             metadata: Arc::new(metadata),
             chunk,
-        })
+            cache: None,
+        };
+        #[cfg(feature = "s3")]
+        if let RawFile::Remote(object) = &self.0.raw {
+            if object.options.preload_chunk_index
+                && matches!(dataset.handle.storage, metadata::Storage::Chunked)
+            {
+                match dataset.handle.prepare_s3_index() {
+                    Ok(()) | Err(Error::Limit { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(dataset)
     }
 
     /// Open an S3 dataset and prebuild its read-only chunk address index in RAM.
@@ -233,7 +276,9 @@ impl H5File {
             return Err(Error::Unsupported("S3 index requires an S3 object"));
         }
         let dataset = self.dataset(name)?;
-        dataset.handle.prepare_s3_index()?;
+        if matches!(dataset.handle.storage, metadata::Storage::Chunked) {
+            dataset.handle.prepare_s3_index()?;
+        }
         Ok(dataset)
     }
 
@@ -245,7 +290,7 @@ impl H5File {
     }
 }
 
-/// A 2D or 3D dataset handle. It keeps its file open and is safe to share
+/// A 1D, 2D or 3D dataset handle. It keeps its file open and is safe to share
 /// between threads.
 #[derive(Clone)]
 pub struct Dataset {
@@ -253,9 +298,30 @@ pub struct Dataset {
     file: H5File,
     metadata: Arc<DatasetMetadata>,
     chunk: Layout,
+    cache: Option<Arc<parking_lot::Mutex<cache::ChunkCache>>>,
 }
 
 impl Dataset {
+    /// Return a handle with an optional decoded-chunk cache, shared by its
+    /// clones. The budget applies to resident decoded byte buffers per cache.
+    pub fn with_chunk_cache(mut self, capacity_bytes: usize) -> Self {
+        self.cache = (capacity_bytes > 0
+            && self.chunk.len <= capacity_bytes
+            && matches!(self.handle.storage, metadata::Storage::Chunked))
+        .then(|| {
+            Arc::new(parking_lot::Mutex::new(cache::ChunkCache::new(
+                capacity_bytes,
+            )))
+        });
+        self
+    }
+
+    fn cache_chunk(&self, origin: [u64; 3], data: Vec<u8>) {
+        if let Some(cache) = &self.cache {
+            cache.lock().insert(origin, data);
+        }
+    }
+
     pub fn metadata(&self) -> &DatasetMetadata {
         &self.metadata
     }
@@ -264,6 +330,73 @@ impl Dataset {
     pub fn read_region(&self, ranges: &[Range<u64>]) -> Result<Region, Error> {
         let selection = self.selection(ranges)?;
         self.file.0.pool.run(|| self.read_owned(selection))
+    }
+
+    /// Read a packed strided region. Negative steps traverse the corresponding
+    /// half-open range from its last element. The bounding region is read first.
+    pub fn read_strided(&self, ranges: &[Range<u64>], steps: &[isize]) -> Result<Region, Error> {
+        self.read_transformed(ranges, steps, false)
+    }
+
+    /// Read a packed strided region, converting the selected values to float32.
+    pub fn read_f32(&self, ranges: &[Range<u64>], steps: &[isize]) -> Result<Region, Error> {
+        self.read_transformed(ranges, steps, true)
+    }
+
+    fn read_transformed(
+        &self,
+        ranges: &[Range<u64>],
+        steps: &[isize],
+        cast: bool,
+    ) -> Result<Region, Error> {
+        if ranges.len() != steps.len() || steps.contains(&0) {
+            return Err(Error::InvalidTransform);
+        }
+        let selection = self.selection(ranges)?;
+        self.file.0.pool.run(|| {
+            let region = transform::stride(self.read_owned(selection)?, steps)?;
+            if !cast
+                || region.dtype
+                    == (DType {
+                        kind: NumericType::F32,
+                        byte_order: ByteOrder::Little,
+                    })
+            {
+                return Ok(region);
+            }
+            let size = Layout::new(&region.shape, 4, "float32 output")?.len;
+            check_limit(size, self.file.0.limits.max_output_bytes, "float32 output")?;
+            Ok(transform::f32(region, error::zeroed(size)?))
+        })
+    }
+
+    /// Reduce fixed-size bins along one axis. The last output axis contains
+    /// [minimum, maximum] in the original datatype. NaNs are ignored unless
+    /// every value in a bin is NaN.
+    pub fn read_min_max(
+        &self,
+        ranges: &[Range<u64>],
+        axis: usize,
+        block: usize,
+    ) -> Result<Region, Error> {
+        let selection = self.selection(ranges)?;
+        let mut shape = selection.shape.clone();
+        if axis >= shape.len() || block == 0 {
+            return Err(Error::InvalidTransform);
+        }
+        shape[axis] = shape[axis].div_ceil(block as u64);
+        let size = Layout::new(&shape, self.metadata.dtype.size() * 2, "min/max output")?.len;
+        check_limit(size, self.file.0.limits.max_output_bytes, "min/max output")?;
+        shape.push(2);
+        self.file.0.pool.run(|| {
+            let input = self.read_owned(selection)?;
+            let output = Region {
+                shape,
+                dtype: input.dtype,
+                bytes: error::zeroed(size)?,
+            };
+            Ok(transform::min_max(input, axis, block, output))
+        })
     }
 
     /// Read a region without blocking the caller's async executor.
@@ -320,6 +453,40 @@ impl Dataset {
         if output.is_empty() {
             return Ok(());
         }
+        let fill = &self.metadata.fill_value;
+        let shape = region::padded(&self.metadata.shape, 1);
+        match self.handle.storage {
+            metadata::Storage::Contiguous(Some(offset)) => {
+                return selection.read_contiguous(
+                    self.chunk,
+                    shape,
+                    fill.len(),
+                    output,
+                    |relative, bytes| {
+                        let address = offset
+                            .checked_add(relative as u64)
+                            .ok_or(Error::Overflow("file offset"))?;
+                        self.file.0.raw.read_exact_at(bytes, address)
+                    },
+                );
+            }
+            metadata::Storage::Contiguous(None) => {
+                for element in output.chunks_exact_mut(fill.len()) {
+                    element.copy_from_slice(fill);
+                }
+                return Ok(());
+            }
+            metadata::Storage::Compact => {
+                if output.len() == self.chunk.len {
+                    return self.handle.read_compact(output);
+                }
+                let mut data = error::zeroed(self.chunk.len)?;
+                self.handle.read_compact(&mut data)?;
+                selection.copy_chunk([0; 3], shape, self.chunk, Some(&data), fill, output);
+                return Ok(());
+            }
+            metadata::Storage::Chunked => {}
+        }
         let chunk_shape = region::padded(&self.metadata.chunks, 1);
         let rank = self.metadata.shape.len();
         let file = &self.file.0;
@@ -329,20 +496,32 @@ impl Dataset {
             RawFile::Remote(_) => self.handle.prepared_index(),
         };
         let threads = file.pool.threads();
+        #[cfg(feature = "s3-async-io")]
+        let threads = match (&file.raw, file.pool.s3_transport()) {
+            (RawFile::Remote(_), Some(transport)) => threads.max(transport.limit),
+            _ => threads,
+        };
         let unfiltered = self.metadata.filters.is_empty();
         let span_limits = match &file.raw {
             RawFile::Local(_) if unfiltered => Some(SpanLimits {
                 chunks: 4,
                 bytes: 512 * 1024,
+                gaps: 0,
             }),
             RawFile::Local(_) => None,
             #[cfg(feature = "s3")]
-            RawFile::Remote(_) => Some(SpanLimits {
-                chunks: 16,
-                bytes: 2 * 1024 * 1024,
+            RawFile::Remote(object) => Some(SpanLimits {
+                chunks: object.options.max_range_chunks,
+                bytes: object.options.max_range_bytes,
+                gaps: object
+                    .options
+                    .max_gap_bytes
+                    .min(object.options.max_range_bytes),
             }),
         };
-        let batch_chunks = threads * span_limits.map_or(1, |limits| limits.chunks);
+        let batch_chunks = threads
+            .saturating_mul(span_limits.map_or(1, |limits| limits.chunks))
+            .min(65_536);
         // Bound the sum across the batch, including staged reads and decoded
         // data. A large filtered chunk can always use the single-chunk path.
         let budget = file
@@ -353,6 +532,21 @@ impl Dataset {
         let mut batch = Vec::with_capacity(batch_chunks);
         let mut used = 0_usize;
         for origin in selection.chunk_origins(chunk_shape) {
+            if let Some(data) = self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.lock().get(origin))
+            {
+                selection.copy_chunk(
+                    origin,
+                    chunk_shape,
+                    self.chunk,
+                    Some(data.as_slice()),
+                    fill,
+                    output,
+                );
+                continue;
+            }
             let location = match locations {
                 Some(index) => index.location(origin),
                 None => self.handle.chunk_location(&origin[3 - rank..])?,
@@ -375,6 +569,11 @@ impl Dataset {
                 size.max(self.chunk.len)
                     .saturating_add(self.chunk.len)
                     .saturating_add(1)
+            };
+            let reserve = if location.is_some() {
+                reserve.saturating_add(span_limits.map_or(0, |limits| limits.gaps))
+            } else {
+                reserve
             };
             if !batch.is_empty() && (batch.len() == batch_chunks || reserve > budget - used) {
                 self.read_batch(&mut batch, selection, chunk_shape, output, span_limits)?;
@@ -414,12 +613,30 @@ impl Dataset {
                 output,
             );
         };
+        #[cfg(feature = "s3-async-io")]
+        if let (RawFile::Remote(_), Some(_)) = (&self.file.0.raw, self.file.0.pool.s3_transport()) {
+            return self.read_grouped_batch(
+                batch,
+                span_limits.unwrap_or(SpanLimits {
+                    chunks: 1,
+                    bytes: 1,
+                    gaps: 0,
+                }),
+                copy,
+            );
+        }
         if let Some(limits) = span_limits.filter(|_| batch.len() > 1) {
             return self.read_grouped_batch(batch, limits, copy);
         }
         match batch {
             [] => {}
-            [job] => copy(job, self.load_chunk(job)?.as_deref()),
+            [job] => {
+                let data = self.load_chunk(job)?;
+                copy(job, data.as_deref());
+                if let Some(data) = data {
+                    self.cache_chunk(job.origin, data);
+                }
+            }
             _ => {
                 let decoded: Result<Vec<_>, _> = batch
                     .par_iter()
@@ -427,6 +644,9 @@ impl Dataset {
                     .collect();
                 for (job, data) in decoded? {
                     copy(job, data.as_deref());
+                    if let Some(data) = data {
+                        self.cache_chunk(job.origin, data);
+                    }
                 }
             }
         }
@@ -451,11 +671,22 @@ impl Dataset {
             self.file.0.raw.read_exact_at(&mut bytes, span.offset)?;
             Ok(bytes)
         };
-        if !self.metadata.filters.is_empty() {
-            let buffers = spans
+        let load_all = || {
+            #[cfg(feature = "s3-async-io")]
+            if let (RawFile::Remote(object), Some(transport)) =
+                (&self.file.0.raw, self.file.0.pool.s3_transport())
+            {
+                let ranges = spans.iter().map(|span| (span.offset, span.len)).collect();
+                let buffers = transport.read(object, ranges)?;
+                return Ok::<_, Error>(spans.iter().zip(buffers).collect::<Vec<_>>());
+            }
+            spans
                 .par_iter()
                 .map(|span| load(span).map(|bytes| (span, bytes)))
-                .collect::<Result<Vec<_>, Error>>()?;
+                .collect::<Result<Vec<_>, Error>>()
+        };
+        if !self.metadata.filters.is_empty() {
+            let buffers = load_all()?;
             let decoded = buffers
                 .par_iter()
                 .flat_map(|(span, bytes)| {
@@ -470,24 +701,33 @@ impl Dataset {
                 .collect::<Result<Vec<_>, Error>>()?;
             for (job, data) in decoded {
                 copy(job, Some(&data));
+                if self.cache.is_some() {
+                    self.cache_chunk(job.origin, data.into_owned());
+                }
             }
             return Ok(());
         }
-        let mut copy_span = |span: &ReadSpan<'_>, mut bytes: &[u8]| {
+        let mut copy_span = |span: &ReadSpan<'_>, bytes: &[u8]| {
             for job in span.jobs {
-                let (chunk, rest) = bytes.split_at(job.size);
-                copy(job, Some(chunk));
-                bytes = rest;
+                let data = span.chunk_bytes(job, bytes);
+                copy(job, Some(data));
+                if self.cache.is_some() {
+                    self.cache_chunk(job.origin, data.to_vec());
+                }
             }
         };
+        #[cfg(feature = "s3-async-io")]
+        if let (RawFile::Remote(_), Some(_)) = (&self.file.0.raw, self.file.0.pool.s3_transport()) {
+            for (span, bytes) in load_all()? {
+                copy_span(span, &bytes);
+            }
+            return Ok(());
+        }
         match spans.as_slice() {
             [] => {}
             [span] => copy_span(span, &load(span)?),
             _ => {
-                let buffers = spans
-                    .par_iter()
-                    .map(|span| load(span).map(|bytes| (span, bytes)))
-                    .collect::<Result<Vec<_>, Error>>()?;
+                let buffers = load_all()?;
                 for (span, bytes) in buffers {
                     copy_span(span, &bytes);
                 }
@@ -531,6 +771,7 @@ struct ChunkJob {
 struct SpanLimits {
     chunks: usize,
     bytes: usize,
+    gaps: usize,
 }
 
 struct ReadSpan<'a> {
@@ -551,12 +792,18 @@ fn read_spans(jobs: &[ChunkJob], limits: SpanLimits) -> Vec<ReadSpan<'_>> {
     let mut start = 0;
     let mut len = 0;
     let mut offset = 0;
+    let mut gaps = 0;
     for (index, job) in jobs.iter().enumerate() {
         let address = job.location.expect("allocated jobs only").offset;
+        let gap = address
+            .checked_sub(offset + len as u64)
+            .and_then(|gap| usize::try_from(gap).ok());
         if len > 0
-            && (address != offset + len as u64
-                || index - start == limits.chunks
-                || job.size > limits.bytes.saturating_sub(len))
+            && (index - start == limits.chunks
+                || gap.is_none_or(|gap| {
+                    gap > limits.gaps - gaps
+                        || gap.saturating_add(job.size) > limits.bytes.saturating_sub(len)
+                }))
         {
             spans.push(ReadSpan {
                 jobs: &jobs[start..index],
@@ -565,9 +812,14 @@ fn read_spans(jobs: &[ChunkJob], limits: SpanLimits) -> Vec<ReadSpan<'_>> {
             });
             start = index;
             len = 0;
+            gaps = 0;
         }
         if len == 0 {
             offset = address;
+        } else {
+            let gap = gap.expect("grouped spans do not overlap");
+            gaps += gap;
+            len += gap;
         }
         len += job.size;
     }

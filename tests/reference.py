@@ -43,6 +43,17 @@ def make_fixtures(root):
         file.create_dataset("fletcher", data=grid, chunks=(4, 6), fletcher32=True)
         file.create_dataset("text", shape=(2, 3), dtype="S4", chunks=(2, 3))
         file.create_dataset("contiguous", data=grid)
+        file.create_dataset("distance", data=np.arange(300, dtype=">f8"))
+        file.create_dataset("distance-chunked", data=np.arange(257, dtype="<i4"), chunks=(32,), compression="gzip")
+        file.create_dataset("contiguous-cube", data=cube.astype(">f4"))
+        file.create_dataset("contiguous-fill", shape=(40,), dtype=">i2", fillvalue=-17)
+        compact = np.arange(12, dtype=">i2").reshape(3, 4)
+        properties = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        properties.set_layout(h5py.h5d.COMPACT)
+        compact_id = h5py.h5d.create(file.id, b"compact", h5py.h5t.py_create(compact.dtype),
+                                    h5py.h5s.create_simple(compact.shape), dcpl=properties)
+        compact_id.write(h5py.h5s.ALL, h5py.h5s.ALL, compact)
+        compact_id.close()
         file.create_dataset("rank4", shape=(1, 1, 1, 1), dtype="u1", chunks=(1, 1, 1, 1))
         file.create_dataset("empty", shape=(0, 7), maxshape=(None, 7), dtype="u1", chunks=(2, 3))
         # 2 TiB of logical data; the fixture contains one four-byte chunk.
@@ -97,7 +108,7 @@ def write_oracle(root):
             (root / f"{case}.bin").write_bytes(expected.tobytes(order="C"))
             cases.write("\t".join([
                 Path(file.filename).name, name, expected.dtype.str, vector(dataset.shape),
-                vector(dataset.chunks), vector(expected.shape),
+                vector(dataset.chunks or ()), vector(expected.shape),
                 vector(start for start, _ in bounds), vector(end for _, end in bounds), str(case),
             ]) + "\n")
 
@@ -115,6 +126,14 @@ def write_oracle(root):
             record(file, "raw3d", [(1, 7), (2, 10), (1, 8)])
             record(file, "empty", [(0, 0), (0, 7)])
             record(file, "high", [(2**40 - 3, 2**40), (0, 2)])
+            record(file, "distance", [(7, 291)])
+            record(file, "distance-chunked", [(30, 257)])
+            record(file, "contiguous-fill", [(5, 35)])
+            record(file, "contiguous", [(1, 9), (0, 17)])
+            record(file, "contiguous", [(1, 9), (2, 13)])
+            record(file, "contiguous-cube", [(1, 6), (2, 6), (0, 9)])
+            record(file, "contiguous-cube", [(1, 6), (0, 11), (0, 9)])
+            record(file, "compact", [(0, 3), (1, 3)])
         with h5py.File(root / "latest.h5", "r") as file:
             record(file, "extendible", [(1, 13), (2, 7)])
 

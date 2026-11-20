@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::Read;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -20,27 +21,67 @@ thread_local! {
     static CALLBACK_ERROR: RefCell<Option<Error>> = const { RefCell::new(None) };
 }
 
+/// Settings for a read-only remote HDF5 handle.
+#[derive(Clone)]
+pub struct S3Options {
+    /// Maximum chunks in a grouped range request.
+    pub max_range_chunks: usize,
+    /// Maximum bytes in a grouped range request, including gaps.
+    pub max_range_bytes: usize,
+    /// Maximum total unused bytes in each grouped range.
+    pub max_gap_bytes: usize,
+    /// Fetch and cache the first 64 KiB during the identity request.
+    pub prefetch_header: bool,
+    /// Build a bounded chunk address index when opening a chunked dataset.
+    pub preload_chunk_index: bool,
+    refresh_url: Option<Arc<dyn Fn() -> Result<String, Error> + Send + Sync>>,
+}
+
+impl Default for S3Options {
+    fn default() -> Self {
+        Self {
+            max_range_chunks: 16,
+            max_range_bytes: 2 * 1024 * 1024,
+            max_gap_bytes: 0,
+            prefetch_header: false,
+            preload_chunk_index: false,
+            refresh_url: None,
+        }
+    }
+}
+
+impl S3Options {
+    /// Renew the URL once after a 401 or 403. The callback must sign the same
+    /// object and must not call back into h5rs.
+    pub fn with_url_refresh(
+        mut self,
+        refresh: impl Fn() -> Result<String, Error> + Send + Sync + 'static,
+    ) -> Self {
+        self.refresh_url = Some(Arc::new(refresh));
+        self
+    }
+}
+
 pub(crate) fn take_callback_error() -> Option<Error> {
     CALLBACK_ERROR.with(|error| error.borrow_mut().take())
 }
 
 pub(crate) struct Object {
     agent: Agent,
-    url: Uri,
+    url: Mutex<Uri>,
+    refresh_lock: Mutex<()>,
     len: u64,
     etag: HeaderValue,
     metadata_pages: Mutex<VecDeque<(u64, Vec<u8>)>>,
+    pub(crate) options: S3Options,
 }
 
 impl Object {
-    pub(crate) fn open(url: &str, connections: usize) -> Result<Self, Error> {
-        let url: Uri = url.parse().map_err(|_| Error::InvalidObjectUrl)?;
-        let scheme = url.scheme_str();
-        let host = url.host().ok_or(Error::InvalidObjectUrl)?;
-        let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-        if scheme != Some("https") && !(scheme == Some("http") && loopback) {
-            return Err(Error::InvalidObjectUrl);
+    pub(crate) fn open(url: &str, connections: usize, options: S3Options) -> Result<Self, Error> {
+        if options.max_range_chunks == 0 || options.max_range_bytes == 0 {
+            return Err(Error::InvalidRangeOptions);
         }
+        let mut url = parse_url(url)?;
         let agent: Agent = Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
             .max_redirects(0)
@@ -48,8 +89,19 @@ impl Object {
             .max_idle_connections_per_host(connections)
             .build()
             .into();
-        let mut response = request(&agent, &url, 0..1, None)?;
-        let len = validate_range(&response, 0..1, None)?;
+        let probe = 0..if options.prefetch_header {
+            PAGE_SIZE
+        } else {
+            1
+        };
+        let mut response = match request(&agent, &url, probe.clone(), None) {
+            Err(Error::RemoteStatus(401 | 403)) if options.refresh_url.is_some() => {
+                url = refresh_url(&url, &options)?;
+                request(&agent, &url, probe.clone(), None)?
+            }
+            other => other?,
+        };
+        let len = validate_range(&response, probe.clone(), None)?;
         let etag = response
             .headers()
             .get(header::ETAG)
@@ -59,13 +111,20 @@ impl Object {
             })
             .cloned()
             .ok_or(Error::InvalidRangeResponse("missing strong ETag"))?;
-        read_body(&mut response, &mut [0])?;
+        let mut data = zeroed(len.min(probe.end) as usize)?;
+        read_body(&mut response, &mut data)?;
+        let mut metadata_pages = VecDeque::new();
+        if options.prefetch_header {
+            metadata_pages.push_back((0, data));
+        }
         Ok(Self {
             agent,
-            url,
+            url: Mutex::new(url),
+            refresh_lock: Mutex::new(()),
             len,
             etag,
-            metadata_pages: Mutex::new(VecDeque::new()),
+            metadata_pages: Mutex::new(metadata_pages),
+            options,
         })
     }
 
@@ -84,7 +143,14 @@ impl Object {
                 "requested range outside object",
             ))?;
         let range = start..end;
-        let mut response = request(&self.agent, &self.url, range.clone(), Some(&self.etag))?;
+        let url = self.current_url();
+        let mut response = match request(&self.agent, &url, range.clone(), Some(&self.etag)) {
+            Err(Error::RemoteStatus(401 | 403)) if self.options.refresh_url.is_some() => {
+                let next = self.renew_url(&url)?;
+                request(&self.agent, &next, range.clone(), Some(&self.etag))?
+            }
+            other => other?,
+        };
         validate_range(&response, range, Some(self.len))?;
         if response.headers().get(header::ETAG) != Some(&self.etag) {
             return Err(Error::ObjectChanged);
@@ -92,7 +158,38 @@ impl Object {
         read_body(&mut response, buffer)
     }
 
+    pub(super) fn current_url(&self) -> Uri {
+        self.url.lock().clone()
+    }
+
+    #[cfg(feature = "s3-async-io")]
+    pub(super) fn can_refresh(&self) -> bool {
+        self.options.refresh_url.is_some()
+    }
+
+    pub(super) fn renew_url(&self, previous: &Uri) -> Result<Uri, Error> {
+        let _guard = self.refresh_lock.lock();
+        let current = self.current_url();
+        if current != *previous {
+            return Ok(current);
+        }
+        let next = refresh_url(previous, &self.options)?;
+        *self.url.lock() = next.clone();
+        Ok(next)
+    }
+
+    #[cfg(feature = "s3-async-io")]
+    pub(super) fn etag(&self) -> &HeaderValue {
+        &self.etag
+    }
+
     fn read_metadata(&self, mut buffer: &mut [u8], mut offset: u64) -> Result<(), Error> {
+        if offset
+            .checked_add(buffer.len() as u64)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(Error::InvalidRangeResponse("metadata range outside object"));
+        }
         if buffer.len() as u64 > PAGE_SIZE {
             return self.read_exact_at(buffer, offset);
         }
@@ -120,6 +217,29 @@ impl Object {
         }
         Ok(())
     }
+}
+
+fn parse_url(url: &str) -> Result<Uri, Error> {
+    let url: Uri = url.parse().map_err(|_| Error::InvalidObjectUrl)?;
+    let scheme = url.scheme_str();
+    let host = url.host().ok_or(Error::InvalidObjectUrl)?;
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    if scheme != Some("https") && !(scheme == Some("http") && loopback) {
+        return Err(Error::InvalidObjectUrl);
+    }
+    Ok(url)
+}
+
+fn refresh_url(old: &Uri, options: &S3Options) -> Result<Uri, Error> {
+    let callback = options.refresh_url.as_ref().ok_or(Error::UrlRefresh)?;
+    let new = parse_url(&callback()?)?;
+    if old.scheme() != new.scheme()
+        || old.authority() != new.authority()
+        || old.path() != new.path()
+    {
+        return Err(Error::UrlRefresh);
+    }
+    Ok(new)
 }
 
 fn request(
@@ -158,15 +278,21 @@ fn validate_range(
     range: Range<u64>,
     known_size: Option<u64>,
 ) -> Result<u64, Error> {
-    if response
-        .headers()
+    validate_range_headers(response.headers(), range, known_size)
+}
+
+pub(super) fn validate_range_headers(
+    headers: &ureq::http::HeaderMap,
+    range: Range<u64>,
+    known_size: Option<u64>,
+) -> Result<u64, Error> {
+    if headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|encoding| encoding != "identity")
     {
         return Err(Error::InvalidRangeResponse("encoded HTTP body"));
     }
-    let parsed = response
-        .headers()
+    let parsed = headers
         .get(header::CONTENT_RANGE)
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.strip_prefix("bytes "))
@@ -187,7 +313,12 @@ fn validate_range(
     if known_size.is_some_and(|known| known != size) {
         return Err(Error::ObjectChanged);
     }
-    if range.start != start || range.end - 1 != end || end >= size {
+    let expected_end = if known_size.is_none() {
+        range.end.min(size)
+    } else {
+        range.end
+    };
+    if range.start != start || expected_end.checked_sub(1) != Some(end) || end >= size {
         return Err(Error::InvalidRangeResponse("unexpected range bounds"));
     }
     Ok(size)
